@@ -10,6 +10,10 @@ SAMPLE_RATE = 16000       # 16 kHz is good for speech
 DURATION_SECONDS = 5      # length of each recording
 AUDIO_FILE = "test.wav"   # reused each time
 
+# ===== Conversation memory =====
+# Each entry: {"role": "customer" | "agent", "content": "<text>"}
+conversation_history: list[dict] = []
+
 
 def record_audio():
     """Record DURATION_SECONDS of mic audio and save to AUDIO_FILE."""
@@ -46,8 +50,28 @@ def transcribe_audio() -> str:
     return text
 
 
+def build_context_block(max_turns: int = 6) -> str:
+    """
+    Build a short text block representing the recent conversation.
+    We'll include up to `max_turns` most recent entries.
+    """
+    if not conversation_history:
+        return "No previous context. This is the first message."
+
+    recent = conversation_history[-max_turns:]
+    lines = []
+    for entry in recent:
+        role = entry["role"]
+        content = entry["content"]
+        if role == "customer":
+            lines.append(f"Customer: {content}")
+        else:
+            lines.append(f"Agent: {content}")
+    return "\n".join(lines)
+
+
 def analyze_with_llm(transcript_text: str) -> dict:
-    """Send transcript to local LLM (Ollama) and return structured analysis."""
+    """Send transcript + recent context to local LLM and return structured analysis."""
     if not transcript_text:
         return {
             "buying_temperature": "UNKNOWN",
@@ -55,13 +79,20 @@ def analyze_with_llm(transcript_text: str) -> dict:
             "suggested_reply": "(No transcript text available.)",
         }
 
+    context_block = build_context_block()
+
     prompt = f"""
 You are a sales-call AI coach.
 
-The customer just said:
+Here is the recent conversation between the customer and the agent:
+\"\"\" 
+{context_block}
+\"\"\"
+
+The customer just said (most recent line):
 \"\"\"{transcript_text}\"\"\"
 
-1. Classify their current buying temperature as one of:
+1. Based on the entire conversation so far, classify their current buying temperature as one of:
    - "COLD"  (just browsing, low commitment, lots of hesitation)
    - "WARM"  (interested but needs reassurance or clarification)
    - "HOT"   (ready or very close to saying yes)
@@ -70,7 +101,7 @@ The customer just said:
    Examples: "price", "timing", "trust", "needs spouse approval",
    "already has a provider", "needs more information", etc.
 
-3. Suggest a short, friendly reply I could say next on a sales call.
+3. Suggest a short, friendly reply the agent could say next on a sales call.
    - 1–3 sentences
    - Conversational
    - No jargon
@@ -85,7 +116,7 @@ Respond ONLY in valid JSON using this exact structure:
 }}
 """
 
-    print("[🤖] Asking local LLM (llama3 via Ollama)...")
+    print("[🤖] Asking local LLM (llama3 via Ollama) with conversation context...")
     result = subprocess.run(
         ["ollama", "run", "llama3"],
         input=prompt.encode("utf-8"),
@@ -116,11 +147,11 @@ Respond ONLY in valid JSON using this exact structure:
 
 
 def main():
-    print("=== Sales Copilot — Local AI Sales Assistant ===")
+    print("=== Sales Copilot — Local AI Sales Assistant (with memory) ===")
     print("This script will:")
     print("  - Record a short audio clip from your mic")
     print("  - Transcribe it locally with Whisper")
-    print("  - Analyze buying temperature & objection")
+    print("  - Use recent conversation history to analyze state")
     print("  - Suggest a reply you can say next")
     print("\nPress Enter to start a new recording, or type 'q' and press Enter to quit.\n")
 
@@ -135,8 +166,14 @@ def main():
 
         # 2) Transcribe
         transcript = transcribe_audio()
+        if not transcript:
+            print("[⚠️] No transcript, skipping analysis.\n")
+            continue
 
-        # 3) Analyze with LLM
+        # Store customer turn in history
+        conversation_history.append({"role": "customer", "content": transcript})
+
+        # 3) Analyze with LLM (using history)
         analysis = analyze_with_llm(transcript)
 
         # 4) Show results
@@ -144,8 +181,13 @@ def main():
         print(f"Buying temperature: {analysis.get('buying_temperature')}")
         print(f"Objection: {analysis.get('objection')}")
         print("\nSuggested reply:\n")
-        print(analysis.get("suggested_reply"))
+        suggested_reply = analysis.get("suggested_reply")
+        print(suggested_reply)
         print("\n-----------------------------\n")
+
+        # Store agent turn in history
+        if suggested_reply:
+            conversation_history.append({"role": "agent", "content": suggested_reply})
 
 
 if __name__ == "__main__":
