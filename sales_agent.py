@@ -14,6 +14,51 @@ AUDIO_FILE = "test.wav"   # reused each time
 # Each entry: {"role": "customer" | "agent", "content": "<text>"}
 conversation_history: list[dict] = []
 
+# Track numeric buying temperature over time (0–100)
+temperature_history: list[int] = []
+
+
+def map_temp_label_to_score(label: str) -> int:
+    """
+    Map COLD / WARM / HOT to a numeric score.
+    You can tweak these numbers later if you want.
+    """
+    if not label:
+        return 50
+    label = label.upper()
+    if "HOT" in label:
+        return 85
+    if "WARM" in label:
+        return 60
+    if "COLD" in label:
+        return 25
+    return 50  # fallback / UNKNOWN
+
+
+def render_temp_bar(score: int, width: int = 20) -> str:
+    """
+    Render a simple text meter like ███████░░░░░░
+    """
+    score = max(0, min(100, score))  # clamp
+    filled = int((score / 100) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def get_trend(temps: list[int]) -> str:
+    """
+    Compare last two scores to show warming / cooling / steady.
+    """
+    if len(temps) < 2:
+        return "—"  # no trend yet
+
+    diff = temps[-1] - temps[-2]
+    if diff > 5:
+        return "warming ↑"
+    elif diff < -5:
+        return "cooling ↓"
+    else:
+        return "steady →"
+
 
 def record_audio():
     """Record DURATION_SECONDS of mic audio and save to AUDIO_FILE."""
@@ -176,12 +221,21 @@ def main():
         # 3) Analyze with LLM (using history)
         analysis = analyze_with_llm(transcript)
 
-        # 4) Show results
-        print("\n=== Analysis ===")
-        print(f"Buying temperature: {analysis.get('buying_temperature')}")
-        print(f"Objection: {analysis.get('objection')}")
-        print("\nSuggested reply:\n")
+        # 4) Show results with temperature meter
+        label = analysis.get("buying_temperature")
+        objection = analysis.get("objection")
         suggested_reply = analysis.get("suggested_reply")
+
+        # Convert label to numeric score and update history
+        score = map_temp_label_to_score(label)
+        temperature_history.append(score)
+
+        print("\n=== Analysis ===")
+        print(f"Buying temperature: {label} ({score}/100)")
+        print(f"  Meter: {render_temp_bar(score)}")
+        print(f"  Trend: {get_trend(temperature_history)}")
+        print(f"Objection: {objection}")
+        print("\nSuggested reply:\n")
         print(suggested_reply)
         print("\n-----------------------------\n")
 
