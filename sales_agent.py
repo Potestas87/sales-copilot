@@ -2,7 +2,9 @@ import argparse
 import datetime
 import json
 import os
+import queue
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 
@@ -16,6 +18,7 @@ CONFIG = {
     "sample_rate": 16000,              # Hz, good for speech
     "duration_seconds": 5,             # length of each recording
     "audio_file": "test.wav",          # reused each time
+    "chunk_seconds": 3,                # streaming chunk length
     "whisper_model": "small",          # try "medium" or "large-v3" on GPU
     "whisper_device": "cpu",           # set to "cuda" for GPU; cpu avoids cuDNN issues
     "whisper_compute_type": "int8",    # int8 on CPU; use float16 on GPU
@@ -162,6 +165,30 @@ def record_audio() -> bool:
         return False
 
 
+def record_chunk(duration: float, filename: str) -> bool:
+    """Record a short chunk to a specific filename."""
+    sample_rate = CONFIG["sample_rate"]
+    try:
+        if os.path.exists(filename):
+            os.remove(filename)
+    except OSError as exc:
+        print(f"[warn] Could not remove existing audio file: {exc}")
+    print(f"[rec] Capturing {duration}s chunk...")
+    try:
+        recording = sd.rec(
+            int(duration * sample_rate),
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+        )
+        sd.wait()
+        write(filename, sample_rate, recording)
+        return True
+    except Exception as exc:
+        print(f"[error] Chunk recording failed: {exc}")
+        return False
+
+
 def _load_whisper() -> WhisperModel | None:
     """Lazy-load WhisperModel so we do not reload every turn."""
     global _whisper_model
@@ -195,8 +222,16 @@ def _load_whisper() -> WhisperModel | None:
 def transcribe_audio() -> str:
     """Transcribe AUDIO_FILE using Whisper and return transcript text."""
     audio_file = ensure_wav(CONFIG["audio_file"])
+    return transcribe_file(audio_file)
+
+
+def transcribe_file(audio_file: str) -> str:
+    """Transcribe a specific audio file path using Whisper."""
     if not os.path.exists(audio_file):
-        print("[warn] No audio file found to transcribe.")
+        if CONFIG.get("absolute_paths"):
+            print(f"[warn] No audio file found to transcribe: {Path(audio_file).resolve()}")
+        else:
+            print(f"[warn] No audio file found to transcribe: {audio_file}")
         return ""
 
     print("[asr] Transcribing audio...")
@@ -213,6 +248,98 @@ def transcribe_audio() -> str:
     except Exception as exc:
         print(f"[error] Transcription failed: {exc}")
         return ""
+
+
+def run_stream_mode() -> None:
+    """Continuously capture short chunks and analyze until interrupted (non-blocking recording)."""
+    chunk_seconds = CONFIG.get("chunk_seconds", 3)
+    chunk_dir = Path("stream_chunks")
+    chunk_dir.mkdir(exist_ok=True)
+    print(f"[stream] Capturing ~{chunk_seconds}s chunks. Press Ctrl+C to stop.\n")
+
+    q: queue.Queue[tuple[int, Path]] = queue.Queue(maxsize=4)
+    stop_event = threading.Event()
+    idx_counter = {"value": 0}
+
+    def record_loop():
+        while not stop_event.is_set():
+            idx_counter["value"] += 1
+            idx = idx_counter["value"]
+            chunk_path = chunk_dir / f"chunk_{idx}.wav"
+            ok = record_chunk(chunk_seconds, str(chunk_path))
+            if not ok:
+                continue
+            try:
+                q.put((idx, chunk_path), timeout=1)
+            except queue.Full:
+                print("[stream] Queue full; dropping chunk.")
+                try:
+                    chunk_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def process_loop():
+        while not stop_event.is_set() or not q.empty():
+            try:
+                idx, chunk_path = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            transcript = transcribe_file(str(chunk_path))
+            if transcript:
+                conversation_history.append({"role": "customer", "content": transcript})
+                log_event("customer_turn", text=transcript, chunk_index=idx, mode="stream")
+
+                analysis = analyze_with_llm(transcript)
+                label = analysis.get("buying_temperature")
+                objection = analysis.get("objection")
+                suggested_reply = analysis.get("suggested_reply")
+
+                score = map_temp_label_to_score(label)
+                temperature_history.append(score)
+
+                print(f"\n=== Chunk {idx} ===")
+                print(f"Transcript: {transcript}")
+                print(f"Buying temperature: {label} ({score}/100)")
+                print(f"  Meter: {render_temp_bar(score)}")
+                print(f"  Trend: {get_trend(temperature_history)}")
+                print(f"Objection: {objection}")
+                print("Suggested reply:")
+                print(suggested_reply)
+                print("-----------------------------")
+
+                if suggested_reply:
+                    conversation_history.append({"role": "agent", "content": suggested_reply})
+                    log_event(
+                        "agent_suggestion",
+                        text=suggested_reply,
+                        buying_temperature=label,
+                        temperature_score=score,
+                        objection=objection,
+                        chunk_index=idx,
+                        mode="stream",
+                    )
+            q.task_done()
+            try:
+                chunk_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    recorder = threading.Thread(target=record_loop, daemon=True)
+    processor = threading.Thread(target=process_loop, daemon=True)
+
+    try:
+        recorder.start()
+        processor.start()
+        while recorder.is_alive() and processor.is_alive():
+            recorder.join(timeout=0.5)
+            processor.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\n[stream] Stopping...")
+    finally:
+        stop_event.set()
+        recorder.join(timeout=1.0)
+        processor.join(timeout=1.0)
 
 
 def build_context_block(max_turns: int = 6) -> str:
@@ -242,6 +369,13 @@ def analyze_with_llm(transcript_text: str) -> dict:
             "buying_temperature": "UNKNOWN",
             "objection": "UNKNOWN",
             "suggested_reply": "(No transcript text available.)",
+        }
+
+    if CONFIG.get("skip_llm") or os.environ.get("SKIP_LLM") == "1":
+        return {
+            "buying_temperature": "WARM",
+            "objection": "none",
+            "suggested_reply": "Got it—how does this align with what you need today?",
         }
 
     context_block = build_context_block()
@@ -284,7 +418,8 @@ Respond ONLY in valid JSON using this exact structure:
     print("[llm] Asking local LLM (llama3 via Ollama) with conversation context...")
     try:
         result = subprocess.run(
-            ["ollama", "run", "llama3"],
+            # --format json nudges Ollama to return strict JSON
+            ["ollama", "run", "llama3", "--format", "json"],
             input=prompt.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -323,10 +458,11 @@ Respond ONLY in valid JSON using this exact structure:
         print("[warn] Failed to parse JSON from model output.")
         print("Raw output was:\n", raw_output)
         print("Error:", exc)
+        fallback_reply = "I understand—can you share what matters most so I can address it?"
         return {
             "buying_temperature": "UNKNOWN",
             "objection": "UNKNOWN",
-            "suggested_reply": raw_output,
+            "suggested_reply": raw_output or fallback_reply,
         }
 
 
@@ -342,10 +478,42 @@ def main():
         default=CONFIG["audio_file"],
         help="Path to WAV file to transcribe (used for dry-run and recording output).",
     )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        help="Override Whisper device (default from CONFIG).",
+    )
+    parser.add_argument(
+        "--compute-type",
+        choices=["int8", "int16", "float16", "float32"],
+        help="Override Whisper compute type (default from CONFIG).",
+    )
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Skip LLM call and return a stubbed suggestion (for fast smoke tests).",
+    )
+    parser.add_argument(
+        "--absolute-paths",
+        action="store_true",
+        help="Show absolute paths in warnings for missing audio files.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Continuous chunked capture and analysis until Ctrl+C.",
+    )
     args = parser.parse_args()
 
     # Override audio file if provided
     CONFIG["audio_file"] = args.audio_file
+    if args.device:
+        CONFIG["whisper_device"] = args.device
+    if args.compute_type:
+        CONFIG["whisper_compute_type"] = args.compute_type
+    if args.skip_llm:
+        CONFIG["skip_llm"] = True
+    CONFIG["absolute_paths"] = args.absolute_paths
 
     # Session metadata
     global SESSION_ID, SESSION_START
@@ -362,7 +530,9 @@ def main():
 
     print("=== Sales Copilot | Local AI Sales Assistant (with memory) ===")
     print("This script will:")
-    if args.dry_run:
+    if args.stream:
+        print("  - Continuously capture short chunks from your mic")
+    elif args.dry_run:
         print("  - Transcribe an existing audio file (dry-run mode)")
     else:
         print("  - Record a short audio clip from your mic")
@@ -372,92 +542,95 @@ def main():
     if not args.dry_run:
         print("\nPress Enter to start a new recording, or type 'q' and press Enter to quit.\n")
 
-    while True:
-        if args.dry_run:
-            choice = ""
-        else:
-            choice = input("[menu] Press Enter to record, or 'q' to quit: ").strip().lower()
-
-        if choice == "q":
-            print("\n[bye] Exiting Sales Copilot. Goodbye.")
-            break
-
-        # 1) Record (skip in dry-run)
-        if not args.dry_run:
-            if not record_audio():
-                continue
-        else:
-            print(f"[dry-run] Using existing audio file: {CONFIG['audio_file']}")
-
-        # 2) Transcribe
-        transcript = transcribe_audio()
-        if not transcript:
-            print("[warn] No transcript, skipping analysis.\n")
+    if args.stream:
+        run_stream_mode()
+    else:
+        while True:
             if args.dry_run:
-                break
-            continue
-
-        # Store customer turn in history
-        conversation_history.append({"role": "customer", "content": transcript})
-        log_event("customer_turn", text=transcript)
-
-        # 3) Analyze with LLM (using history)
-        analysis = analyze_with_llm(transcript)
-
-        # 4) Show results with temperature meter
-        label = analysis.get("buying_temperature")
-        objection = analysis.get("objection")
-        suggested_reply = analysis.get("suggested_reply")
-
-        # Convert label to numeric score and update history
-        score = map_temp_label_to_score(label)
-        temperature_history.append(score)
-
-        print("\n=== Analysis ===")
-        print(f"Buying temperature: {label} ({score}/100)")
-        print(f"  Meter: {render_temp_bar(score)}")
-        print(f"  Trend: {get_trend(temperature_history)}")
-        print(f"Objection: {objection}")
-        print("\nSuggested reply:\n")
-        print(suggested_reply)
-        print("\n-----------------------------\n")
-
-        # Store agent turn in history
-        suggestion_used: bool | None = None
-        outcome = None
-        if suggested_reply:
-            conversation_history.append({"role": "agent", "content": suggested_reply})
-            log_event(
-                "agent_suggestion",
-                text=suggested_reply,
-                buying_temperature=label,
-                temperature_score=score,
-                objection=objection,
-            )
-            # Capture feedback/outcome
-            if args.dry_run:
-                outcome = "dry-run"
+                choice = ""
             else:
-                feedback = input("[feedback] Did you use this reply? (y/n/skip): ").strip().lower()
-                if feedback in ("y", "yes"):
-                    suggestion_used = True
-                elif feedback in ("n", "no"):
-                    suggestion_used = False
+                choice = input("[menu] Press Enter to record, or 'q' to quit: ").strip().lower()
+
+            if choice == "q":
+                print("\n[bye] Exiting Sales Copilot. Goodbye.")
+                break
+
+            # 1) Record (skip in dry-run)
+            if not args.dry_run:
+                if not record_audio():
+                    continue
+            else:
+                print(f"[dry-run] Using existing audio file: {CONFIG['audio_file']}")
+
+            # 2) Transcribe
+            transcript = transcribe_audio()
+            if not transcript:
+                print("[warn] No transcript, skipping analysis.\n")
+                if args.dry_run:
+                    break
+                continue
+
+            # Store customer turn in history
+            conversation_history.append({"role": "customer", "content": transcript})
+            log_event("customer_turn", text=transcript)
+
+            # 3) Analyze with LLM (using history)
+            analysis = analyze_with_llm(transcript)
+
+            # 4) Show results with temperature meter
+            label = analysis.get("buying_temperature")
+            objection = analysis.get("objection")
+            suggested_reply = analysis.get("suggested_reply")
+
+            # Convert label to numeric score and update history
+            score = map_temp_label_to_score(label)
+            temperature_history.append(score)
+
+            print("\n=== Analysis ===")
+            print(f"Buying temperature: {label} ({score}/100)")
+            print(f"  Meter: {render_temp_bar(score)}")
+            print(f"  Trend: {get_trend(temperature_history)}")
+            print(f"Objection: {objection}")
+            print("\nSuggested reply:\n")
+            print(suggested_reply)
+            print("\n-----------------------------\n")
+
+            # Store agent turn in history
+            suggestion_used: bool | None = None
+            outcome = None
+            if suggested_reply:
+                conversation_history.append({"role": "agent", "content": suggested_reply})
+                log_event(
+                    "agent_suggestion",
+                    text=suggested_reply,
+                    buying_temperature=label,
+                    temperature_score=score,
+                    objection=objection,
+                )
+                # Capture feedback/outcome
+                if args.dry_run:
+                    outcome = "dry-run"
                 else:
-                    suggestion_used = None
-                outcome = input("[feedback] Call outcome (won/lost/other, blank=unknown): ").strip() or "unknown"
+                    feedback = input("[feedback] Did you use this reply? (y/n/skip): ").strip().lower()
+                    if feedback in ("y", "yes"):
+                        suggestion_used = True
+                    elif feedback in ("n", "no"):
+                        suggestion_used = False
+                    else:
+                        suggestion_used = None
+                    outcome = input("[feedback] Call outcome (won/lost/other, blank=unknown): ").strip() or "unknown"
 
-            log_event(
-                "suggestion_feedback",
-                suggestion_used=suggestion_used,
-                outcome=outcome,
-                suggested_reply=suggested_reply,
-            )
+                log_event(
+                    "suggestion_feedback",
+                    suggestion_used=suggestion_used,
+                    outcome=outcome,
+                    suggested_reply=suggested_reply,
+                )
 
-        if args.dry_run:
-            # Run once in dry-run mode, then exit
-            print("[dry-run] Completed one pass. Exiting.")
-            break
+            if args.dry_run:
+                # Run once in dry-run mode, then exit
+                print("[dry-run] Completed one pass. Exiting.")
+                break
 
     # Session end
     if SESSION_START:
