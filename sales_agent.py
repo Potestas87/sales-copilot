@@ -251,7 +251,11 @@ def transcribe_file(audio_file: str) -> str:
 
 
 def run_stream_mode() -> None:
-    """Continuously capture short chunks and analyze until interrupted (non-blocking recording)."""
+    """Continuously capture short chunks and analyze until interrupted (non-blocking recording).
+
+    Heuristic end-of-utterance: accumulate speech chunks; when we hit a silent/empty chunk,
+    flush the buffered transcript to the LLM. Keeps recording while LLM processes.
+    """
     chunk_seconds = CONFIG.get("chunk_seconds", 3)
     chunk_dir = Path("stream_chunks")
     chunk_dir.mkdir(exist_ok=True)
@@ -260,6 +264,8 @@ def run_stream_mode() -> None:
     q: queue.Queue[tuple[int, Path]] = queue.Queue(maxsize=4)
     stop_event = threading.Event()
     idx_counter = {"value": 0}
+    pending_parts: list[str] = []
+    last_speech_idx: int | None = None
 
     def record_loop():
         while not stop_event.is_set():
@@ -286,11 +292,23 @@ def run_stream_mode() -> None:
                 continue
 
             transcript = transcribe_file(str(chunk_path))
-            if transcript:
-                conversation_history.append({"role": "customer", "content": transcript})
-                log_event("customer_turn", text=transcript, chunk_index=idx, mode="stream")
 
-                analysis = analyze_with_llm(transcript)
+            is_silence = not transcript.strip()
+            if not is_silence:
+                pending_parts.append(transcript)
+                last_speech_idx = idx
+                print(f"[chunk {idx}] {transcript}")
+            else:
+                print(f"[chunk {idx}] (silence)")
+
+            should_flush = is_silence and pending_parts
+            if should_flush:
+                utterance = " ".join(pending_parts).strip()
+                pending_parts.clear()
+                conversation_history.append({"role": "customer", "content": utterance})
+                log_event("customer_turn", text=utterance, chunk_index=idx, mode="stream")
+
+                analysis = analyze_with_llm(utterance)
                 label = analysis.get("buying_temperature")
                 objection = analysis.get("objection")
                 suggested_reply = analysis.get("suggested_reply")
@@ -298,8 +316,8 @@ def run_stream_mode() -> None:
                 score = map_temp_label_to_score(label)
                 temperature_history.append(score)
 
-                print(f"\n=== Chunk {idx} ===")
-                print(f"Transcript: {transcript}")
+                print(f"\n=== Utterance ending at chunk {idx} ===")
+                print(f"Transcript: {utterance}")
                 print(f"Buying temperature: {label} ({score}/100)")
                 print(f"  Meter: {render_temp_bar(score)}")
                 print(f"  Trend: {get_trend(temperature_history)}")
