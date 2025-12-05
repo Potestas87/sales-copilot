@@ -1,6 +1,6 @@
 # Sales Copilot (local Whisper + Ollama)
 
-Local-first sales-call assistant that records or ingests audio, transcribes with Whisper, keeps short-term context, and asks an LLM (Ollama) for objection classification and a suggested reply. Logs everything to JSONL for later analysis.
+Local-first sales-call assistant that records or ingests audio, transcribes with Whisper, keeps short-term context, and asks an LLM (Ollama) for objection classification and a suggested reply. Logs everything to JSONL for later analysis. Supports one-shot recording, dry-run with existing files, and streaming chunks so capture continues while the LLM thinks.
 
 ## Quickstart
 ```bash
@@ -30,12 +30,25 @@ python smoke_test.py --audio-file path\to\clip.wav
 ```
 Runs one transcribe + LLM pass for quick verification.
 
+### Streaming mode (keeps recording while LLM runs)
+```bash
+python sales_agent.py --stream
+```
+Captures ~3s chunks by default, processes each, and continues recording in parallel. Stop with Ctrl+C.
+
 ### Samples
 Place your test WAVs under `samples/`, e.g. `samples/sample.wav`, then run:
 ```bash
 python smoke_test.py --audio-file samples/sample.wav
 python sales_agent.py --dry-run --audio-file samples/sample.wav
 ```
+
+### Useful flags
+- `--device cpu|cuda` and `--compute-type int8|int16|float16|float32` override Whisper settings.
+- `--skip-llm` (or env `SKIP_LLM=1`) stubs the LLM response for fast ASR-only checks.
+- `--absolute-paths` shows full paths when an audio file is missing.
+- `--stream` runs continuous chunked capture; `--dry-run` ingests an existing file once.
+- MP3 inputs auto-convert to WAV via `ffmpeg` if available.
 
 ## Config notes
 - Whisper settings are in `CONFIG` at the top of `sales_agent.py`.
