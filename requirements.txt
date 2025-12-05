@@ -1,0 +1,4 @@
+sounddevice
+scipy
+faster-whisper
+ollama
